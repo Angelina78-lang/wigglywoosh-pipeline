@@ -211,3 +211,94 @@ class FusionEngine:
 
         # RULE 4: Soft disagreement — trust IMU by default
         return (imu_label, round(imu_conf * 0.7, 4))
+
+# Section 8: TimelineWriter
+class TimelineWriter:
+    """Validates and serializes timeline entries to JSON at 2 Hz."""
+
+    def build(self, entries: List[TimelineEntry]) -> List[dict]:
+        data: List[dict] = []
+        for entry in entries:
+            assert entry.activity in {'Active', 'Static'}, f"Invalid activity label: {entry.activity}"
+            assert 0.0 <= entry.confidence <= 1.0, f"Invalid confidence score: {entry.confidence}"
+            data.append({
+                "timestamp_ms": entry.timestamp_ms,
+                "activity": entry.activity,
+                "confidence": entry.confidence
+            })
+        return data
+
+    def write(self, data: List[dict], output_path: str) -> None:
+        parent: str = os.path.dirname(output_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(data, f, indent=2)
+        logger.info(f"Written {len(data)} entries to {output_path}")
+
+# Section 9: main()
+def main() -> None:
+    parser = argparse.ArgumentParser(description="WigglyWoosh Dog Activity sync pipeline")
+    parser.add_argument('--video', type=str, required=True, help="Path to video file")
+    parser.add_argument('--imu', type=str, required=True, help="Path to IMU CSV log file")
+    parser.add_argument('--output', type=str, default="timeline.json", help="Path to write final output JSON")
+    parser.add_argument('--verbose', action='store_true', help="Enable debug level verbose logging")
+    
+    args = parser.parse_args()
+    
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        
+    logger.info("Initializing VideoClassifier and IMUProcessor...")
+    try:
+        video_clf: VideoClassifier = VideoClassifier(args.video)
+        imu_proc: IMUProcessor = IMUProcessor(args.imu)
+        fusion: FusionEngine = FusionEngine()
+        writer: TimelineWriter = TimelineWriter()
+        
+        logger.info("Decoding video and grouping frames into windows...")
+        windows: List[VideoWindow] = video_clf.extract_windows(WINDOW_SIZE_MS)
+        logger.info(f"Extracted {len(windows)} video windows.")
+        
+        # Cap windows to match the minimum of video duration and IMU duration
+        imu_max_time: int = int(imu_proc.df.timestamp_ms.max())
+        capped_duration: int = min(video_clf.duration_ms, imu_max_time)
+        n_capped_windows: int = int(capped_duration // WINDOW_SIZE_MS)
+        windows = windows[:n_capped_windows]
+        logger.info(f"Capped to {len(windows)} synchronized windows.")
+        
+        entries: List[TimelineEntry] = []
+        for i, window in enumerate(windows):
+            v_label, v_conf = video_clf.classify_window(window)
+            imu_feat: IMUFeatures = imu_proc.get_window_features(window.start_ms, window.end_ms)
+            
+            if imu_feat.n_samples == 0:
+                # Use video label directly if IMU window has no samples
+                f_label, f_conf = v_label, v_conf
+                i_label, i_conf, i_score = 'None', 0.0, 0.0
+            else:
+                i_label, i_conf, i_score = imu_proc.classify_window(imu_feat)
+                f_label, f_conf = fusion.fuse(v_label, v_conf, i_label, i_conf, i_score)
+            
+            logger.debug(
+                f"Window {i:02d} [{window.start_ms:5d}-{window.end_ms:5d} ms] | "
+                f"Video: {v_label} (conf={v_conf:.4f}) | "
+                f"IMU: {i_label} (score={i_score:.4f}, conf={i_conf:.4f}) | "
+                f"Fused: {f_label} (conf={f_conf:.4f})"
+            )
+            entries.append(TimelineEntry(window.start_ms, f_label, f_conf))
+            
+        timeline_data = writer.build(entries)
+        writer.write(timeline_data, args.output)
+        print(f"Pipeline complete. {len(entries)} windows. Output: {args.output}")
+        
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        logger.error(f"Fatal pipeline error: {str(e)}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        sys.exit(1)
+
+# Section 10: Entrypoint
+if __name__ == '__main__':
+    main()
