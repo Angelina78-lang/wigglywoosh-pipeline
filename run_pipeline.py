@@ -52,6 +52,81 @@ class TimelineEntry:
     activity: str
     confidence: float
 
+# Section 5: VideoClassifier
+class VideoClassifier:
+    """Extracts and classifies dog activity from video frames using optical flow."""
+
+    def __init__(self, video_path: str) -> None:
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        self.cap: cv2.VideoCapture = cv2.VideoCapture(video_path)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Failed to open video at: {video_path}")
+        self.fps: float = float(self.cap.get(cv2.CAP_PROP_FPS))
+        self.total_frames: int = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.duration_ms: int = int(self.total_frames / self.fps * 1000)
+        # Pretrained MobileNetV2 for feature representation
+        self.model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
+        self.model.eval()
+        self.transform = T.Compose([
+            T.ToPILImage(),
+            T.Resize(FRAME_RESIZE),
+            T.ToTensor(),
+            T.Normalize(IMAGENET_MEAN, IMAGENET_STD)
+        ])
+
+    def extract_windows(self, window_size_ms: int = WINDOW_SIZE_MS) -> List[VideoWindow]:
+        n_windows: int = int(self.duration_ms // window_size_ms)
+        step: int = max(1, int(self.fps // VIDEO_SAMPLE_FPS))
+        windows: List[VideoWindow] = []
+        try:
+            for i in range(n_windows):
+                start_ms: int = i * window_size_ms
+                end_ms: int = (i + 1) * window_size_ms
+                frames: List[np.ndarray] = []
+                start_idx: int = int(start_ms / 1000 * self.fps)
+                end_idx: int = int(end_ms / 1000 * self.fps)
+                
+                # Boundary safety check
+                start_idx = min(start_idx, self.total_frames)
+                end_idx = min(end_idx, self.total_frames)
+                
+                # Seek to start frame
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+                for idx in range(start_idx, end_idx):
+                    ret: bool
+                    frame: np.ndarray
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        break
+                    if (idx - start_idx) % step == 0:
+                        frame = cv2.resize(frame, FRAME_RESIZE)
+                        frames.append(frame)
+                windows.append(VideoWindow(start_ms, end_ms, frames))
+        finally:
+            self.cap.release()
+        return windows
+
+    def classify_window(self, window: VideoWindow) -> Tuple[str, float]:
+        if len(window.frames) < 2:
+            return ('Static', 0.5)
+        motion_values: List[float] = []
+        for i in range(len(window.frames) - 1):
+            gray1: np.ndarray = cv2.cvtColor(window.frames[i], cv2.COLOR_BGR2GRAY)
+            gray2: np.ndarray = cv2.cvtColor(window.frames[i+1], cv2.COLOR_BGR2GRAY)
+            flow: np.ndarray = cv2.calcOpticalFlowFarneback(
+                gray1, gray2, None, 0.5, 3, 15, 3, 5, 1.2, 0
+            )
+            mag: np.ndarray = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
+            motion_values.append(float(np.mean(mag)))
+        
+        motion_energy: float = float(np.mean(motion_values))
+        video_conf: float = float(np.clip(
+            1.0 / (1.0 + np.exp(-(motion_energy / MOTION_THRESHOLD - 1.0))),
+            0.0, 1.0
+        ))
+        label: str = 'Active' if motion_energy > MOTION_THRESHOLD else 'Static'
+        return (label, round(video_conf, 4))
 
 # Section 6: IMUProcessor
 class IMUProcessor:
