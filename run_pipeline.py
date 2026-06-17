@@ -185,3 +185,29 @@ class IMUProcessor:
         raw_conf: float = abs(S - 0.5) * 2.0
         confidence: float = round(float(np.clip(raw_conf, 0.0, 1.0)), 4)
         return (label, confidence, S)
+
+# Section 7: FusionEngine
+class FusionEngine:
+    """Merges video and IMU signals using priority-ordered override rules."""
+
+    def fuse(self, video_label: str, video_conf: float,
+             imu_label: str, imu_conf: float,
+             imu_active_score: float) -> Tuple[str, float]:
+        # RULE 1: Strong IMU Active Override (camera obstruction recovery)
+        if (video_label == 'Static'
+                and imu_active_score > IMU_STRONG_ACTIVE_SCORE
+                and imu_conf > IMU_OVERRIDE_CONFIDENCE_MIN):
+            return ('Active', round(imu_conf * OVERRIDE_CONFIDENCE_PENALTY, 4))
+
+        # RULE 2: Strong IMU Static Override (video false positive)
+        if (video_label == 'Active'
+                and imu_active_score < IMU_STRONG_STATIC_SCORE
+                and imu_conf > IMU_OVERRIDE_CONFIDENCE_MIN):
+            return ('Static', round(imu_conf * OVERRIDE_CONFIDENCE_PENALTY, 4))
+
+        # RULE 3: Agreement
+        if video_label == imu_label:
+            return (video_label, round((video_conf + imu_conf) / 2.0, 4))
+
+        # RULE 4: Soft disagreement — trust IMU by default
+        return (imu_label, round(imu_conf * 0.7, 4))
